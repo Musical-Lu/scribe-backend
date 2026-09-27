@@ -100,6 +100,19 @@ the landing page.
 
 Never log a code, a token, or the contents of one of these rows.
 
+## Sunet Drive (`routers/drive.py`, `utils/drive.py`, `db/drive.py`)
+
+Get from / Save to Sunet Drive ([#64](https://github.com/SUNET/scribe-backend/issues/64)). Sunet Drive is Nextcloud, one instance per organisation (`https://<org>.drive.sunet.se`).
+
+- **Offered per customer, instance per user.** `Customer.drive_enabled` gates everything (403 `disabled` otherwise); `Customer.drive_url` is the organisation's default instance, `User.drive_url` the user's own choice, which wins; `Customer.drive_display_name` is presentation only (default `DRIVE_DEFAULT_DISPLAY_NAME`).
+- **Only Sunet Drive hosts, ever.** `normalise_instance()` accepts https on a host ending in one of `DRIVE_ALLOWED_HOST_SUFFIXES` as a whole label (`.drive.sunet.se` admits `su.drive.sunet.se`, not `evildrive.sunet.se`), no port, path, userinfo. A user can type their own instance, so this is the SSRF control -- do not loosen it to "any https URL". Redirects are never followed (`http_client()`), and every URL Nextcloud hands back (login page, poll endpoint, the `server` a login finished on) must be on the instance's own host (`same_host()`).
+- **Login Flow v2, no standing access.** `POST /drive/connect` starts it and answers the URL the user opens in a tab of its own; `GET /drive/connect` polls. The resulting app password is stored in `drive_connection`, encrypted with `encrypt_with_key` under `derive_key(API_SECRET_KEY, b"sunet-scribe-drive-connection-v1")` (the poll token too), for `DRIVE_SESSION_IDLE_SECONDS` after last use. `revoke_idle_drive_connections` in `app.py` takes expired rows in one `DELETE ... RETURNING` and **revokes each app password in Drive** (`DELETE /ocs/v2.php/core/apppassword`), not only here. Connecting again, disconnecting, or moving to another instance revokes the old grant as well. The row is in the database because of `--workers 8` -- start and poll seldom land in one process.
+- **WebDAV as the user.** Paths go through `clean_path()` (no `..`, `.`, control characters) and are quoted segment by segment; the DAV user id comes from `/ocs/v2.php/cloud/user`, not the login name (they differ under federated sign-in). PROPFIND is parsed with `defusedxml`.
+- **Transfers stream.** Import (`POST /drive/import`) streams the WebDAV GET straight into `encrypt_stream_to_file` for api_user, exactly like an upload, capped at `RECORDING_MAX_BYTES` while it arrives; only the upload dialog's media extensions are accepted; a failed import removes its job. Save (`PUT /drive/files?path=&name=&overwrite=`) streams the request body to a WebDAV PUT, capped at `DRIVE_MAX_SAVE_BYTES`, and sends `If-None-Match: *` unless `overwrite` -- 409 `exists` rather than a silent overwrite. Saving never deletes anything in Scribe.
+- **409, not 401, for a lost Drive grant** (`reason: not_connected`): the frontend reads 401 as the *Scribe* session ending. A 401 from Drive also drops the stored connection.
+
+Tests: `tests/test_drive.py` (pretend Nextcloud on an `httpx.MockTransport`, in-memory SQLite). Migration `b3d5f7a9c1e2`.
+
 ## Admin hierarchy
 
 - **BOFH** (`bofh=True`): full access to all resources across all realms.
@@ -169,4 +182,4 @@ The frontend's recorder (`/record` in scribe-ui) sends a recording **in parts wh
 .venv/bin/python -m pytest
 ```
 
-Suites: `test_autentication.py`, `test_auth_handoff.py`, `test_crypto.py`, `test_recordings.py`, `test_rules.py`. The process does not exit by itself after the run: `utils/notifications.py` starts a non-daemon timer thread at import. The results are printed first; run with a `timeout` in scripts. Add a test for any auth/permission/crypto change before merging.
+Suites: `test_autentication.py` (needs a live `fastapi dev` on :8000, skipped without one), `test_auth_handoff.py`, `test_crypto.py`, `test_drive.py`, `test_recordings.py`, `test_rules.py`. `utils/notifications.py` starts its re-arming mail timer at import; it is a daemon thread, so the run exits on its own -- keep it that way, or pytest hangs after printing its results. Add a test for any auth/permission/crypto change before merging.

@@ -44,6 +44,9 @@ async def customer_create(
     support_contact_email: Optional[str] = None,
     notes: Optional[str] = None,
     blocks_purchased: Optional[int] = 0,
+    drive_enabled: bool = False,
+    drive_url: Optional[str] = None,
+    drive_display_name: Optional[str] = None,
 ) -> dict:
     """
     Create a new customer in the database.
@@ -59,6 +62,9 @@ async def customer_create(
         support_contact_email (Optional[str]): Support contact email shown to end users.
         notes (Optional[str]): Additional notes about the customer.
         blocks_purchased (Optional[int]): Number of blocks purchased (for fixed plans).
+        drive_enabled (bool): Whether the Sunet Drive integration is offered.
+        drive_url (Optional[str]): The organisation's Drive instance, normalised.
+        drive_display_name (Optional[str]): What the organisation calls its Drive.
 
     Returns:
         dict: Dictionary representation of the created customer.
@@ -76,6 +82,9 @@ async def customer_create(
             realms=realms,
             notes=notes,
             blocks_purchased=blocks_purchased if blocks_purchased else 0,
+            drive_enabled=bool(drive_enabled),
+            drive_url=drive_url or None,
+            drive_display_name=drive_display_name or None,
         )
 
         session.add(customer)
@@ -212,6 +221,9 @@ async def customer_update(
     realms: Optional[str] = None,
     notes: Optional[str] = None,
     blocks_purchased: Optional[int] = None,
+    drive_enabled: Optional[bool] = None,
+    drive_url: Optional[str] = None,
+    drive_display_name: Optional[str] = None,
 ) -> Optional[dict]:
     """
     Update customer metadata.
@@ -228,6 +240,10 @@ async def customer_update(
         realms (Optional[str]): New comma-separated list of realms for the customer.
         notes (Optional[str]): New notes for the customer.
         blocks_purchased (Optional[int]): New number of blocks purchased.
+        drive_enabled (Optional[bool]): Whether Sunet Drive is offered.
+        drive_url (Optional[str]): The organisation's Drive instance; "" clears it.
+        drive_display_name (Optional[str]): What the organisation calls its
+            Drive; "" clears it.
 
     Returns:
         Optional[dict]: Dictionary representation of the updated customer if found, else empty dict.
@@ -260,6 +276,12 @@ async def customer_update(
             customer.notes = notes
         if blocks_purchased is not None:
             customer.blocks_purchased = blocks_purchased
+        if drive_enabled is not None:
+            customer.drive_enabled = drive_enabled
+        if drive_url is not None:
+            customer.drive_url = drive_url or None
+        if drive_display_name is not None:
+            customer.drive_display_name = drive_display_name or None
 
         log.info(f"Customer {customer.name} (ID: {customer.id}) updated.")
 

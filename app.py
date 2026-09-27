@@ -33,6 +33,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from auth.oidc import RefreshToken, oauth, verify_token, verify_user
 from db.analytics import log_page_view
 from db.auth_handoff import handoff_cleanup, handoff_create, handoff_redeem
+from db.drive import drive_take_expired
 from db.onboarding_attributes import seed_default_attributes
 from db.job import job_cleanup
 from utils.recordings import recordings
@@ -58,6 +59,8 @@ from routers.external import router as external_router
 from routers.healthcheck import router as healthcheck_router
 from routers.job import router as job_router
 from routers.recording import router as recording_router
+from routers.drive import router as drive_router
+from utils import drive as drive_client
 from routers.rules import router as rules_router
 from routers.transcriber import router as transcriber_router
 from routers.user import router as user_router
@@ -241,6 +244,7 @@ async def analytics_middleware(request: Request, call_next):
 app.include_router(transcriber_router, prefix=settings.API_PREFIX, tags=["transcriber"])
 app.include_router(job_router, prefix=settings.API_PREFIX, tags=["job"])
 app.include_router(recording_router, prefix=settings.API_PREFIX, tags=["recording"])
+app.include_router(drive_router, prefix=settings.API_PREFIX, tags=["drive"])
 app.include_router(user_router, prefix=settings.API_PREFIX, tags=["user"])
 app.include_router(videostream_router, prefix=settings.API_PREFIX, tags=["video"])
 app.include_router(external_router, prefix=settings.API_PREFIX, tags=["external"])
@@ -543,6 +547,30 @@ async def remove_expired_auth_handoffs() -> None:
         return
 
     await handoff_cleanup()
+
+
+@app.on_event("startup")
+@repeat_every(seconds=60 * 5)
+async def revoke_idle_drive_connections() -> None:
+    """
+    Periodic task to end Drive connections nobody has used for
+    DRIVE_SESSION_IDLE_SECONDS: each app password is revoked on the Drive
+    side, not only forgotten here, so Scribe never keeps standing access to
+    anybody's Drive.
+
+    Returns:
+        None
+    """
+
+    if not scheduler_worker:
+        return
+
+    for connection in await drive_take_expired():
+        await drive_client.revoke(
+            connection["instance"],
+            connection["login_name"],
+            connection["app_password"],
+        )
 
 
 @app.on_event("startup")

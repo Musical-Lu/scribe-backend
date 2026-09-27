@@ -107,6 +107,32 @@ class Settings(BaseSettings):
     # up again after this is sent again rather than lost.
     RECORDING_ABANDON_HOURS: int = 48
 
+    # Sunet Drive (Nextcloud) integration (routers/drive.py, utils/drive.py).
+    # Hosts Scribe will talk to on a user's behalf, as suffixes: an instance
+    # URL -- set by an organisation or by a user for themselves -- must be
+    # https on a host ending in one of these. It is what keeps the feature
+    # to Sunet Drive rather than any Nextcloud anywhere, and what keeps a
+    # user-supplied URL from pointing the backend at an internal address.
+    # Comma-separated in the environment.
+    DRIVE_ALLOWED_HOST_SUFFIXES: list[str] = [".drive.sunet.se"]
+    DRIVE_DEFAULT_DISPLAY_NAME: str = "Sunet Drive"
+    # A connection nobody has used for this long is revoked on the Drive
+    # side and forgotten here. Every use pushes it forward.
+    DRIVE_SESSION_IDLE_SECONDS: int = 60 * 60
+    # Nextcloud's own Login Flow v2 token lasts 20 minutes.
+    DRIVE_LOGIN_TTL_SECONDS: int = 20 * 60
+    DRIVE_HTTP_TIMEOUT_SECONDS: float = 30.0
+    # A file saved to Drive is sent from the frontend in one request.
+    DRIVE_MAX_SAVE_BYTES: int = 200 * 1024 * 1024
+    DRIVE_MAX_LIST_ENTRIES: int = 2000
+
+    @field_validator("DRIVE_ALLOWED_HOST_SUFFIXES", mode="before")
+    @classmethod
+    def decode_drive_suffixes(cls, v) -> list[str]:
+        if isinstance(v, str):
+            return [x.strip().lower() for x in v.split(",") if x.strip()]
+        return [str(x).lower() for x in v]
+
     # E-mail notifications
     NOTIFICATION_MAIL_UPDATED: dict = {
         "subject": "Your e-mail address have been updated",

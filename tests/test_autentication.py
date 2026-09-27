@@ -19,7 +19,17 @@ import pytest
 import requests
 
 BASE_URL = "http://localhost:8000"
-OPENAPI_SPEC = requests.get(f"{BASE_URL}/api/openapi.json").json()
+
+# These run against a live backend (`fastapi dev`), reading its routes from
+# the OpenAPI spec. Without one answering, the whole module is skipped --
+# it used to error at collection, or hang it with no timeout at all.
+try:
+    OPENAPI_SPEC = requests.get(f"{BASE_URL}/api/openapi.json", timeout=5).json()
+except (requests.RequestException, ValueError):
+    pytest.skip(
+        f"No backend answering on {BASE_URL}; start one with `fastapi dev`.",
+        allow_module_level=True,
+    )
 PUBLIC_ENDPOINTS = {
     "/api/docs",
     "/api/login",

@@ -494,6 +494,10 @@ class User(SQLModel, table=True):
         ),
         description="User's theme preference: dark, light, or auto",
     )
+    drive_url: Optional[str] = Field(
+        default=None,
+        description="The user's own choice of Drive instance, over their organisation's",
+    )
 
     def as_dict(self) -> dict:
         """
@@ -523,6 +527,7 @@ class User(SQLModel, table=True):
             "user_id": self.user_id,
             "username": self.username,
             "dark_mode": self.dark_mode,
+            "drive_url": self.drive_url,
         }
 
 
@@ -715,6 +720,18 @@ class Customer(SQLModel, table=True):
         default=0,
         description="Number of 4000-minute blocks purchased (for fixed plan)",
     )
+    drive_enabled: bool = Field(
+        default=False,
+        description="Whether the Sunet Drive integration is offered to this customer's users",
+    )
+    drive_url: Optional[str] = Field(
+        default=None,
+        description="The organisation's Drive instance, e.g. https://su.drive.sunet.se",
+    )
+    drive_display_name: Optional[str] = Field(
+        default=None,
+        description="What the organisation calls its Drive; presentation only",
+    )
 
     def as_dict(self) -> dict:
         """
@@ -736,6 +753,9 @@ class Customer(SQLModel, table=True):
             "notes": self.notes,
             "created_at": str(self.created_at),
             "blocks_purchased": self.blocks_purchased if self.blocks_purchased else 0,
+            "drive_enabled": bool(self.drive_enabled),
+            "drive_url": self.drive_url,
+            "drive_display_name": self.drive_display_name,
         }
 
 
@@ -1039,4 +1059,49 @@ class AuthHandoff(SQLModel, table=True):
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC).replace(tzinfo=None),
         description="When the login that produced this finished",
+    )
+
+
+class DriveConnection(SQLModel, table=True):
+    """
+    One user's connection to their Sunet Drive (Nextcloud), made with
+    Nextcloud's Login Flow v2.
+
+    Two states share the row. While the user is signing in to Drive in a
+    tab of their own, it holds the flow's poll endpoint and token; once they
+    have granted access, it holds the app password Drive issued instead, and
+    the Drive user id WebDAV paths are built from.
+
+    Every secret here -- the poll token, the app password -- is encrypted
+    under a key derived from API_SECRET_KEY, never stored in the clear. The
+    row is short-lived by design: it expires DRIVE_SESSION_IDLE_SECONDS
+    after it was last used, and the sweeper revokes the app password on the
+    Drive side before deleting it, so Scribe never keeps standing access to
+    anybody's Drive. One row per user; connecting again replaces it.
+    """
+
+    __tablename__ = "drive_connection"
+
+    user_id: str = Field(primary_key=True, description="The Scribe user")
+    instance: str = Field(description="https://<host> of the Drive instance")
+    poll_endpoint: Optional[str] = Field(
+        default=None, description="Login Flow v2 poll URL, while signing in"
+    )
+    poll_token: Optional[str] = Field(
+        default=None, description="Login Flow v2 poll token, encrypted"
+    )
+    login_name: Optional[str] = Field(
+        default=None, description="Drive login name, once connected"
+    )
+    app_password: Optional[str] = Field(
+        default=None, description="Drive app password, encrypted, once connected"
+    )
+    dav_user: Optional[str] = Field(
+        default=None, description="Drive user id, for WebDAV paths"
+    )
+    expires_at: datetime = Field(
+        index=True, description="After this the connection is revoked and swept"
+    )
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC).replace(tzinfo=None),
     )

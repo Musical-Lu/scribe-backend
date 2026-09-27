@@ -29,6 +29,9 @@ from db.customer import (
     export_customers_to_csv,
 )
 
+from typing import Optional
+
+from utils.drive import DriveError, normalise_instance
 from utils.log import get_logger
 
 from auth.oidc import get_current_admin_user
@@ -40,6 +43,20 @@ from utils.validators import (
 
 log = get_logger()
 router = APIRouter(tags=["admin"])
+
+
+def _drive_url(value: Optional[str]) -> Optional[str]:
+    """
+    A customer's Drive instance as sent, normalised. None leaves it as it
+    is, "" clears it; anything else must be a Sunet Drive address.
+    """
+
+    if value is None:
+        return None
+    if not value.strip():
+        return ""
+
+    return normalise_instance(value)
 
 
 @router.get("/admin/customers", include_in_schema=False)
@@ -96,6 +113,11 @@ async def create_customer(
             content={"error": "Missing required fields"}, status_code=400
         )
 
+    try:
+        drive_url = _drive_url(item.drive_url)
+    except DriveError as error:
+        return JSONResponse(content={"error": str(error)}, status_code=400)
+
     customer = await customer_create(
         customer_abbr=item.customer_abbr,
         partner_id=item.partner_id,
@@ -107,6 +129,9 @@ async def create_customer(
         support_contact_email=item.support_contact_email,
         notes=item.notes,
         blocks_purchased=item.blocks_purchased,
+        drive_enabled=bool(item.drive_enabled),
+        drive_url=drive_url,
+        drive_display_name=(item.drive_display_name or "").strip() or None,
     )
 
     return JSONResponse(content={"result": customer})
@@ -159,6 +184,11 @@ async def update_customer(
         log.warning(f"Non-BOFH user {admin_user['user_id']} denied access to update customer {customer_id}")
         return JSONResponse(content={"error": "User not authorized"}, status_code=403)
 
+    try:
+        drive_url = _drive_url(item.drive_url)
+    except DriveError as error:
+        return JSONResponse(content={"error": str(error)}, status_code=400)
+
     customer = await customer_update(
         customer_id,
         customer_abbr=item.customer_abbr,
@@ -171,6 +201,13 @@ async def update_customer(
         support_contact_email=item.support_contact_email,
         notes=item.notes,
         blocks_purchased=item.blocks_purchased,
+        drive_enabled=item.drive_enabled,
+        drive_url=drive_url,
+        drive_display_name=(
+            item.drive_display_name.strip()
+            if item.drive_display_name is not None
+            else None
+        ),
     )
 
     if not customer:

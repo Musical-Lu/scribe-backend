@@ -44,7 +44,13 @@ class Notifications:
         self.__queue = collections.deque()
 
         def handler() -> None:
-            threading.Timer(3.0, handler).start()
+            # A daemon, so this re-arming timer alone never keeps a process
+            # alive: the server's own main thread does that, and anything
+            # else importing this module (the test suite, scripts) could
+            # otherwise never exit.
+            timer = threading.Timer(3.0, handler)
+            timer.daemon = True
+            timer.start()
 
             while len(self.__queue) > 0:
                 notification = self.__queue.popleft()

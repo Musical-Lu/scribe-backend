@@ -63,6 +63,9 @@ class CreateCustomerRequest(BaseModel):
     support_contact_email: Optional[str] = ""
     notes: Optional[str] = ""
     blocks_purchased: Optional[int] = 0
+    drive_enabled: Optional[bool] = False
+    drive_url: Optional[str] = None
+    drive_display_name: Optional[str] = Field(default=None, max_length=64)
 
 
 class UpdateCustomerRequest(BaseModel):
@@ -76,6 +79,9 @@ class UpdateCustomerRequest(BaseModel):
     support_contact_email: Optional[str] = None
     notes: Optional[str] = None
     blocks_purchased: Optional[int] = None
+    drive_enabled: Optional[bool] = None
+    drive_url: Optional[str] = None
+    drive_display_name: Optional[str] = Field(default=None, max_length=64)
 
 
 class TranscribeExternalPost(BaseModel):
@@ -205,3 +211,24 @@ class AuthExchangeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     code: str = Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class DriveInstanceRequest(BaseModel):
+    """
+    A user's own choice of Drive instance. None (or empty) clears it, so
+    their organisation's is used again.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: Optional[str] = Field(default=None, max_length=256)
+
+
+class DriveImportRequest(BaseModel):
+    """
+    A file in the user's Drive to bring into Scribe as a new job.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=4096)
