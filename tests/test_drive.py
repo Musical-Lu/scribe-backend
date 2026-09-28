@@ -29,8 +29,6 @@ import os
 
 os.environ.setdefault("API_DATABASE_URL", "sqlite://")
 
-import json
-
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
@@ -525,7 +523,7 @@ def customer():
 
 @pytest.fixture()
 def user():
-    return {"user_id": USER_ID, "drive_url": None}
+    return {"user_id": USER_ID}
 
 
 @pytest.fixture()
@@ -536,9 +534,6 @@ def api(monkeypatch, customer, user, keys, tmp_path, fake):
 
     async def customer_for(_user_id):
         return customer
-
-    async def set_drive_url(_user_id, url):
-        user["drive_url"] = url
 
     jobs = {}
 
@@ -562,7 +557,6 @@ def api(monkeypatch, customer, user, keys, tmp_path, fake):
         return serialize_public_key_to_pem(pair[1])
 
     monkeypatch.setattr(drive_router, "customer_get_from_user_id", customer_for)
-    monkeypatch.setattr(drive_router, "user_set_drive_url", set_drive_url)
     monkeypatch.setattr(drive_router, "job_create", job_create)
     monkeypatch.setattr(drive_router, "job_update", job_update)
     monkeypatch.setattr(drive_router, "job_remove", job_remove)
@@ -596,12 +590,33 @@ async def test_drive_is_hidden_from_an_organisation_without_it(api, customer):
 
     for method, url in [
         ("POST", "/api/v1/drive/connect"),
+        ("GET", "/api/v1/drive/connect"),
         ("GET", "/api/v1/drive/files"),
-        ("PUT", "/api/v1/drive/instance"),
     ]:
-        response = await api.request(method, url, json={"url": None})
+        response = await api.request(method, url)
         assert response.status_code == 403
         assert response.json()["reason"] == "disabled"
+
+
+@pytest.mark.parametrize("drive_url", [None, "", "https://example.com"])
+@pytest.mark.asyncio
+async def test_an_organisation_without_a_sunet_drive_instance_has_no_drive(
+    api, customer, drive_url
+):
+    customer["drive_url"] = drive_url
+
+    status = await api.get("/api/v1/drive")
+    assert status.json()["result"]["enabled"] is False
+
+    response = await api.post("/api/v1/drive/connect")
+    assert response.json()["reason"] == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_users_cannot_choose_an_instance(api):
+    response = await api.put("/api/v1/drive/instance", json={"url": INSTANCE})
+
+    assert response.status_code in (404, 405)
 
 
 @pytest.mark.asyncio
@@ -614,23 +629,6 @@ async def test_the_organisation_names_its_own_drive(api, customer):
     customer["drive_display_name"] = None
     status = (await api.get("/api/v1/drive")).json()["result"]
     assert status["display_name"] == "Sunet Drive"
-
-
-@pytest.mark.asyncio
-async def test_a_user_chooses_their_own_instance(api, user, customer):
-    customer["drive_url"] = None
-    status = (await api.get("/api/v1/drive")).json()["result"]
-    assert status["instance"] is None
-    assert (await api.post("/api/v1/drive/connect")).json()["reason"] == "no_instance"
-
-    refused = await api.put("/api/v1/drive/instance", json={"url": "https://example.com"})
-    assert refused.status_code == 400
-    assert user["drive_url"] is None
-
-    chosen = await api.put("/api/v1/drive/instance", json={"url": "su.drive.sunet.se"})
-    assert chosen.json()["result"]["instance"] == INSTANCE
-    assert user["drive_url"] == INSTANCE
-    assert (await api.get("/api/v1/drive")).json()["result"]["user_instance"] == INSTANCE
 
 
 @pytest.mark.asyncio
@@ -674,13 +672,26 @@ async def test_a_grant_revoked_in_drive_ends_the_connection(api, fake):
 
 
 @pytest.mark.asyncio
-async def test_moving_to_another_instance_drops_the_connection(api, fake):
+async def test_a_connection_to_an_instance_the_organisation_left_does_not_count(
+    api, fake, customer
+):
     await connect(api, fake)
 
-    await api.put("/api/v1/drive/instance", json={"url": "https://kau.drive.sunet.se"})
+    customer["drive_url"] = "https://kau.drive.sunet.se"
 
-    assert APP_PASSWORD in fake.revoked
     assert (await api.get("/api/v1/drive/files")).json()["reason"] == "not_connected"
+    assert not (await api.get("/api/v1/drive")).json()["result"]["connected"]
+
+
+@pytest.mark.asyncio
+async def test_logging_out_revokes_the_grant_in_drive(api, fake):
+    await connect(api, fake)
+
+    response = await api.delete("/api/v1/drive/connect")
+
+    assert response.json()["result"]["state"] == "none"
+    assert APP_PASSWORD in fake.revoked
+    assert not (await api.get("/api/v1/drive")).json()["result"]["connected"]
 
 
 @pytest.mark.asyncio
@@ -764,3 +775,195 @@ async def test_a_save_cannot_climb_out_of_the_drive(api, fake):
     )
 
     assert response.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Customer settings
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def admin_api(monkeypatch):
+    import routers.customers as customers_router
+    from auth.oidc import get_current_admin_user
+
+    app = FastAPI()
+    app.include_router(customers_router.router, prefix="/api/v1")
+    app.dependency_overrides[get_current_admin_user] = lambda: {
+        "user_id": "bofh", "bofh": True, "admin": True
+    }
+
+    stored = {"drive_enabled": False, "drive_url": None}
+    saved = {}
+
+    async def create(**kwargs):
+        saved.update(kwargs)
+        return kwargs
+
+    async def update(customer_id, **kwargs):
+        saved.update(kwargs)
+        return kwargs
+
+    async def get(customer_id):
+        return stored
+
+    monkeypatch.setattr(customers_router, "customer_create", create)
+    monkeypatch.setattr(customers_router, "customer_update", update)
+    monkeypatch.setattr(customers_router, "customer_get", get)
+
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://scribe"
+    )
+    client.stored, client.saved = stored, saved
+    return client
+
+
+@pytest.mark.asyncio
+async def test_a_customer_drive_instance_must_be_sunet_drive(admin_api):
+    response = await admin_api.put(
+        "/api/v1/admin/customers/1",
+        json={"drive_enabled": True, "drive_url": "https://example.com"},
+    )
+
+    assert response.status_code == 400
+    assert admin_api.saved == {}
+
+
+@pytest.mark.asyncio
+async def test_drive_cannot_be_offered_without_an_instance(admin_api):
+    created = await admin_api.post(
+        "/api/v1/admin/customers",
+        json={"partner_id": "N/A", "name": "Org", "drive_enabled": True},
+    )
+    assert created.status_code == 400
+
+    updated = await admin_api.put(
+        "/api/v1/admin/customers/1", json={"drive_enabled": True}
+    )
+    assert updated.status_code == 400
+
+    admin_api.stored.update(drive_enabled=True, drive_url=INSTANCE)
+    cleared = await admin_api.put("/api/v1/admin/customers/1", json={"drive_url": ""})
+    assert cleared.status_code == 400
+    assert admin_api.saved == {}
+
+
+@pytest.mark.asyncio
+async def test_a_customer_drive_instance_is_saved_normalised(admin_api):
+    response = await admin_api.put(
+        "/api/v1/admin/customers/1",
+        json={"drive_enabled": True, "drive_url": "SU.drive.sunet.se"},
+    )
+
+    assert response.status_code == 200
+    assert admin_api.saved["drive_url"] == INSTANCE
+    assert admin_api.saved["drive_enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# A recording's original, saved to Drive
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def original(monkeypatch, keys, tmp_path):
+    """
+    A recording's original on disk, encrypted for its owner as
+    utils/recordings.py keeps it, and the job that names it.
+    """
+
+    import asyncio
+
+    from utils.crypto import (
+        encrypt_stream_to_file,
+        encrypt_string,
+        serialize_private_key_to_pem,
+    )
+    from utils.recordings import original_path
+
+    private, public = keys["user"]
+    audio = b"OggS" + os.urandom(3000)
+    path = original_path(USER_ID, "job-9")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    class Reader:
+        def __init__(self, data):
+            self.data = data
+
+        async def read(self, size=-1):
+            chunk, self.data = self.data[:size], self.data[size:]
+            return chunk
+
+    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        encrypt_stream_to_file(public, Reader(audio), str(path))
+    )
+
+    job = {"uuid": "job-9", "filename": encrypt_string(public, "Seminar.webm")}
+
+    async def job_get(uuid, user_id):
+        return job if uuid == "job-9" and user_id == USER_ID else None
+
+    async def private_key(user_id):
+        return serialize_private_key_to_pem(private, b"secret")
+
+    monkeypatch.setattr(drive_router, "job_get", job_get)
+    monkeypatch.setattr(drive_router, "user_get_private_key", private_key)
+
+    return audio
+
+
+@pytest.mark.asyncio
+async def test_an_original_is_saved_decrypted_under_its_own_name(api, fake, original):
+    await connect(api, fake)
+
+    response = await api.post(
+        "/api/v1/drive/save-original",
+        json={"job_id": "job-9", "encryption_password": "secret", "path": "Notes"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["path"] == "Notes/Seminar.webm"
+    assert fake.files["Notes/Seminar.webm"] == original
+
+
+@pytest.mark.asyncio
+async def test_an_original_is_not_overwritten_unless_asked(api, fake, original):
+    await connect(api, fake)
+    fake.files["Seminar.webm"] = b"older"
+    body = {"job_id": "job-9", "encryption_password": "secret"}
+
+    refused = await api.post("/api/v1/drive/save-original", json=body)
+    assert refused.status_code == 409
+    assert refused.json()["reason"] == "exists"
+    assert fake.files["Seminar.webm"] == b"older"
+
+    renamed = await api.post(
+        "/api/v1/drive/save-original", json={**body, "name": "Seminar (2).webm"}
+    )
+    assert renamed.status_code == 200
+    assert fake.files["Seminar (2).webm"] == original
+
+
+@pytest.mark.asyncio
+async def test_an_original_needs_the_encryption_password(api, fake, original):
+    await connect(api, fake)
+
+    response = await api.post(
+        "/api/v1/drive/save-original",
+        json={"job_id": "job-9", "encryption_password": "wrong"},
+    )
+
+    assert response.status_code == 403
+    assert "Seminar.webm" not in fake.files
+
+
+@pytest.mark.asyncio
+async def test_only_a_job_with_an_original_has_one_to_save(api, fake, original):
+    await connect(api, fake)
+
+    response = await api.post(
+        "/api/v1/drive/save-original",
+        json={"job_id": "someone-elses", "encryption_password": "secret"},
+    )
+
+    assert response.status_code == 404

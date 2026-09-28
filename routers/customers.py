@@ -59,6 +59,9 @@ def _drive_url(value: Optional[str]) -> Optional[str]:
     return normalise_instance(value)
 
 
+DRIVE_INSTANCE_REQUIRED = "A Drive instance is required to offer Drive."
+
+
 @router.get("/admin/customers", include_in_schema=False)
 async def list_customers(
     request: Request,
@@ -117,6 +120,11 @@ async def create_customer(
         drive_url = _drive_url(item.drive_url)
     except DriveError as error:
         return JSONResponse(content={"error": str(error)}, status_code=400)
+
+    # Users do not choose an instance themselves, so Drive offered without
+    # one would be a switch that does nothing.
+    if item.drive_enabled and not drive_url:
+        return JSONResponse(content={"error": DRIVE_INSTANCE_REQUIRED}, status_code=400)
 
     customer = await customer_create(
         customer_abbr=item.customer_abbr,
@@ -188,6 +196,19 @@ async def update_customer(
         drive_url = _drive_url(item.drive_url)
     except DriveError as error:
         return JSONResponse(content={"error": str(error)}, status_code=400)
+
+    if item.drive_enabled or (item.drive_enabled is None and drive_url == ""):
+        current = await customer_get(customer_id) or {}
+        enabled = (
+            item.drive_enabled
+            if item.drive_enabled is not None
+            else current.get("drive_enabled")
+        )
+        url = drive_url if drive_url is not None else current.get("drive_url")
+        if enabled and not url:
+            return JSONResponse(
+                content={"error": DRIVE_INSTANCE_REQUIRED}, status_code=400
+            )
 
     customer = await customer_update(
         customer_id,

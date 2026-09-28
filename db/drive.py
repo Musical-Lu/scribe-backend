@@ -16,7 +16,7 @@
 # limitations under the License.
 
 """
-Users' connections to their Sunet Drive, and their choice of instance.
+Users' connections to their Sunet Drive.
 
 A connection is a DriveConnection row (see db/models.py): while the user is
 signing in to Drive it holds the Login Flow v2 poll token, and once they
@@ -39,7 +39,7 @@ from typing import Optional
 
 from sqlalchemy import delete, select
 
-from db.models import DriveConnection, User
+from db.models import DriveConnection
 from db.session import get_async_session
 from utils.crypto import decrypt_with_key, derive_key, encrypt_with_key
 from utils.log import get_logger
@@ -259,14 +259,3 @@ async def drive_take_expired() -> list[dict]:
 
     return expired
 
-
-async def user_set_drive_url(user_id: str, drive_url: Optional[str]) -> None:
-    """
-    Store a user's own choice of Drive instance, or clear it (None) to fall
-    back to their organisation's.
-    """
-
-    async with get_async_session() as session:
-        result = await session.execute(select(User).where(User.user_id == user_id))
-        if user := result.scalars().first():
-            user.drive_url = drive_url

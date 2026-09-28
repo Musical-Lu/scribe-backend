@@ -494,10 +494,6 @@ class User(SQLModel, table=True):
         ),
         description="User's theme preference: dark, light, or auto",
     )
-    drive_url: Optional[str] = Field(
-        default=None,
-        description="The user's own choice of Drive instance, over their organisation's",
-    )
 
     def as_dict(self) -> dict:
         """
@@ -527,7 +523,6 @@ class User(SQLModel, table=True):
             "user_id": self.user_id,
             "username": self.username,
             "dark_mode": self.dark_mode,
-            "drive_url": self.drive_url,
         }
 
 

@@ -213,17 +213,6 @@ class AuthExchangeRequest(BaseModel):
     code: str = Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
 
 
-class DriveInstanceRequest(BaseModel):
-    """
-    A user's own choice of Drive instance. None (or empty) clears it, so
-    their organisation's is used again.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    url: Optional[str] = Field(default=None, max_length=256)
-
-
 class DriveImportRequest(BaseModel):
     """
     A file in the user's Drive to bring into Scribe as a new job.
@@ -232,3 +221,19 @@ class DriveImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     path: str = Field(min_length=1, max_length=4096)
+
+
+class DriveSaveOriginalRequest(BaseModel):
+    """
+    A recording's original to save in the user's Drive, decrypted with the
+    user's encryption password on the way -- the same check a download of
+    it makes. `name` defaults to the recording's own file name.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1, max_length=64)
+    encryption_password: Optional[str] = ""
+    path: str = Field(default="", max_length=4096)
+    name: Optional[str] = Field(default=None, max_length=255)
+    overwrite: bool = False

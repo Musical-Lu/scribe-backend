@@ -18,7 +18,7 @@
 """Add the Sunet Drive integration.
 
 Per customer: whether Drive is offered, the organisation's instance and
-what it calls it. Per user: their own choice of instance. And a table of
+what it calls it. And a table of
 short-lived Drive connections (Login Flow v2), which hold an encrypted app
 password for at most an idle hour.
 
@@ -66,11 +66,6 @@ def upgrade() -> None:
             if column.name not in customer_columns:
                 op.add_column("customer", column.copy())
 
-    if "users" in tables:
-        user_columns = {c["name"] for c in inspector.get_columns("users")}
-        if "drive_url" not in user_columns:
-            op.add_column("users", sa.Column("drive_url", sa.String(), nullable=True))
-
     if "drive_connection" not in tables:
         op.create_table(
             "drive_connection",
@@ -102,11 +97,6 @@ def downgrade() -> None:
     if "drive_connection" in tables:
         op.drop_index("ix_drive_connection_expires_at", table_name="drive_connection")
         op.drop_table("drive_connection")
-
-    if "users" in tables and "drive_url" in {
-        c["name"] for c in inspector.get_columns("users")
-    }:
-        op.drop_column("users", "drive_url")
 
     if "customer" in tables:
         customer_columns = {c["name"] for c in inspector.get_columns("customer")}

@@ -19,28 +19,29 @@
 Get from / Save to Sunet Drive (SUNET/scribe-backend#64).
 
 Offered only to users whose organisation has it enabled (Customer.
-drive_enabled). Which Drive instance is used is the user's own choice when
-they have made one (User.drive_url), otherwise their organisation's
-(Customer.drive_url) -- either way it has to be a Sunet Drive host, see
-utils/drive.py.
+drive_enabled) *and* has said which Drive is theirs (Customer.drive_url, a
+Sunet Drive host -- see utils/drive.py). Users do not choose an instance:
+an organisation without one simply does not get Drive.
 
 The flow, as the frontend drives it:
 
 - GET  /drive                  what is offered: enabled, display name,
                                instance, connected.
-- PUT  /drive/instance         the user's own choice of instance.
 - POST /drive/connect          start signing in to Drive; answers the URL the
                                user opens in a tab of its own.
 - GET  /drive/connect          poll: has the user granted access yet?
-- DELETE /drive/connect        disconnect, revoking the grant in Drive.
+- DELETE /drive/connect        log out of Drive, revoking the grant there.
 - GET  /drive/files?path=      list a folder.
 - POST /drive/import           bring a file in as a new job.
 - PUT  /drive/files?path=&name=&overwrite=
                                save the request body as a file in Drive.
+- POST /drive/save-original    save a recording's original in Drive,
+                               decrypted on the way, never via the
+                               frontend.
 
 Errors carry {"error": <message fit to show>, "reason": <code>}. The
-reasons the frontend acts on: "disabled" (hide Drive), "no_instance" (ask
-for one), "not_connected" (connect again), "exists" (ask to overwrite).
+reasons the frontend acts on: "disabled" (hide Drive), "not_connected"
+(connect again), "exists" (ask to overwrite).
 "not_connected" is 409 rather than 401 on purpose: a 401 from this API
 means the *Scribe* session is over, and the frontend treats it that way.
 """
@@ -62,20 +63,23 @@ from db.drive import (
     drive_remove,
     drive_start,
     drive_touch,
-    user_set_drive_url,
 )
-from db.job import job_create, job_remove, job_update
+from db.job import job_create, job_get, job_remove, job_update
 from db.models import JobStatusEnum, JobType
-from db.user import user_get, user_get_public_key
+from db.user import user_get, user_get_private_key, user_get_public_key
 from utils import drive
 from utils.crypto import (
+    decrypt_data_from_file,
+    load_private_key,
     deserialize_public_key_from_pem,
     encrypt_stream_to_file,
     encrypt_string,
 )
 from utils.log import get_logger
 from utils.settings import get_settings
-from utils.validators import DriveImportRequest, DriveInstanceRequest
+from routers.transcriber import decrypt_filename
+from utils.recordings import original_path
+from utils.validators import DriveImportRequest, DriveSaveOriginalRequest
 
 router = APIRouter(tags=["drive"])
 settings = get_settings()
@@ -110,37 +114,30 @@ def _drive_error(error: drive.DriveError) -> JSONResponse:
 async def _context(user: dict) -> dict | JSONResponse:
     """
     What Drive means for this user: whether it is offered, what it is
-    called, and which instance it is.
+    called, and which instance it is -- their organisation's.
 
     Returns:
-        dict: {"enabled", "display_name", "instance", "user_instance",
-            "org_instance"}, or a JSONResponse refusing the request when
-            Drive is not offered to them.
+        dict: {"enabled", "display_name", "instance"}, or a JSONResponse
+            refusing the request when Drive is not offered to them.
     """
 
     customer = await customer_get_from_user_id(user["user_id"]) or {}
 
-    if not customer.get("drive_enabled"):
+    try:
+        instance = drive.normalise_instance(customer.get("drive_url"))
+    except drive.DriveError:
+        instance = None
+
+    if not customer.get("drive_enabled") or not instance:
         return _error(
             "Drive is not available for your organisation.", 403, "disabled"
         )
-
-    def valid(url: Optional[str]) -> Optional[str]:
-        try:
-            return drive.normalise_instance(url) if url else None
-        except drive.DriveError:
-            return None
-
-    user_instance = valid(user.get("drive_url"))
-    org_instance = valid(customer.get("drive_url"))
 
     return {
         "enabled": True,
         "display_name": customer.get("drive_display_name")
         or settings.DRIVE_DEFAULT_DISPLAY_NAME,
-        "instance": user_instance or org_instance,
-        "user_instance": user_instance,
-        "org_instance": org_instance,
+        "instance": instance,
     }
 
 
@@ -159,8 +156,8 @@ async def _connection(user: dict) -> tuple[dict, dict] | JSONResponse:
 
     connection = await drive_get(user["user_id"])
 
-    # A connection made to an instance the user has since moved away from
-    # does not count.
+    # A connection made to an instance the organisation has since moved
+    # away from does not count.
     if (
         not connection
         or not connection["connected"]
@@ -222,35 +219,6 @@ async def drive_status(user: dict = Depends(get_current_user)) -> JSONResponse:
     )
 
 
-@router.put("/drive/instance")
-async def drive_set_instance(
-    item: DriveInstanceRequest, user: dict = Depends(get_current_user)
-) -> JSONResponse:
-    """
-    Set (or clear) the user's own choice of Drive instance.
-    """
-
-    context = await _context(user)
-    if isinstance(context, JSONResponse):
-        return context
-
-    try:
-        url = drive.normalise_instance(item.url) if (item.url or "").strip() else None
-    except drive.DriveError as error:
-        return _error(str(error), 400, "invalid")
-
-    await user_set_drive_url(user["user_id"], url)
-
-    # A connection belongs to the instance it was made to.
-    connection = await drive_get(user["user_id"])
-    if connection and connection["instance"] != (url or context["org_instance"]):
-        await _revoke(await drive_remove(user["user_id"]))
-
-    return JSONResponse(
-        content={"result": {"instance": url or context["org_instance"]}}
-    )
-
-
 @router.post("/drive/connect")
 async def drive_connect(user: dict = Depends(get_current_user)) -> JSONResponse:
     """
@@ -262,9 +230,6 @@ async def drive_connect(user: dict = Depends(get_current_user)) -> JSONResponse:
     context = await _context(user)
     if isinstance(context, JSONResponse):
         return context
-
-    if not context["instance"]:
-        return _error("Choose which Drive to use first.", 400, "no_instance")
 
     try:
         flow = await drive.login_start(context["instance"])
@@ -334,7 +299,8 @@ async def drive_connect_poll(user: dict = Depends(get_current_user)) -> JSONResp
 @router.delete("/drive/connect")
 async def drive_disconnect(user: dict = Depends(get_current_user)) -> JSONResponse:
     """
-    Disconnect from Drive, revoking Scribe's access there as well.
+    Log out of Drive: Scribe's access is revoked there as well, and the
+    next Get from / Save to asks the user to sign in again.
     """
 
     await _revoke(await drive_remove(user["user_id"]))
@@ -507,5 +473,77 @@ async def drive_save(
         return _drive_error(error)
 
     log.info(f"User {user['user_id']} saved a file to Drive.")
+
+    return JSONResponse(content={"result": {"path": target}})
+
+
+async def _chunks(iterator):
+    """
+    A sync iterator of bytes -- decrypt_data_from_file() -- as an async
+    one, each chunk decrypted off the event loop.
+    """
+
+    done = object()
+
+    while (chunk := await asyncio.to_thread(next, iterator, done)) is not done:
+        yield chunk
+
+
+@router.post("/drive/save-original")
+async def drive_save_original(
+    item: DriveSaveOriginalRequest, user: dict = Depends(get_current_user)
+) -> JSONResponse:
+    """
+    Save the original of a recording made in the browser to the user's
+    Drive: decrypted with their encryption password, exactly as a download
+    of it is (POST /transcriber/{job_id}/original), and streamed from disk
+    straight into a WebDAV PUT. It never passes through the frontend or
+    the user's own device, and is never on disk in the clear.
+
+    Answers 409 "exists" unless `overwrite`, like PUT /drive/files.
+    """
+
+    found = await _connection(user)
+    if isinstance(found, JSONResponse):
+        return found
+
+    _, connection = found
+
+    job = await job_get(item.job_id, user["user_id"])
+    file_path = original_path(user["user_id"], item.job_id)
+
+    if not job or not await asyncio.to_thread(file_path.exists):
+        return _error("That recording has no original.", 404, "not_found")
+
+    try:
+        private_key = await load_private_key(
+            await user_get_private_key(user["user_id"]),
+            item.encryption_password or "",
+        )
+    except Exception:
+        return _error("Wrong encryption password.", 403, "invalid")
+
+    try:
+        name = item.name
+        if not name:
+            name = (
+                await asyncio.to_thread(decrypt_filename, dict(job), private_key)
+            ).get("filename") or "Recording"
+        folder = drive.clean_path(item.path)
+        name = drive.clean_name(name)
+    except drive.DriveError as error:
+        return _drive_error(error)
+
+    target = f"{folder}/{name}" if folder else name
+    content = _chunks(decrypt_data_from_file(private_key, str(file_path)))
+
+    try:
+        await drive.upload(connection, target, content, overwrite=item.overwrite)
+    except drive.DriveError as error:
+        if isinstance(error, drive.DriveUnauthorized):
+            await _forget(user["user_id"])
+        return _drive_error(error)
+
+    log.info(f"User {user['user_id']} saved the original of {item.job_id} to Drive.")
 
     return JSONResponse(content={"result": {"path": target}})
