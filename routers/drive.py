@@ -338,9 +338,33 @@ async def drive_list(
     return JSONResponse(content={"result": {"path": path, "entries": entries}})
 
 
+class ImportCancelled(Exception):
+    """The caller hung up part way through an import."""
+
+
+class _WatchedReader:
+    """
+    A reader that gives up as soon as the request it serves has been
+    abandoned. The frontend's Cancel closes its connection; without this,
+    the import would carry on fetching from Drive regardless and make the
+    job it was told not to.
+    """
+
+    def __init__(self, reader, request: Request) -> None:
+        self._reader = reader
+        self._request = request
+
+    async def read(self, size: int = -1) -> bytes:
+        if await self._request.is_disconnected():
+            raise ImportCancelled()
+        return await self._reader.read(size)
+
+
 @router.post("/drive/import")
 async def drive_import(
-    item: DriveImportRequest, user: dict = Depends(get_current_user)
+    request: Request,
+    item: DriveImportRequest,
+    user: dict = Depends(get_current_user),
 ) -> JSONResponse:
     """
     Bring a file from the user's Drive into Scribe as a new job, exactly as
@@ -387,13 +411,19 @@ async def drive_import(
         await asyncio.to_thread(folder.mkdir, parents=True, exist_ok=True)
         await encrypt_stream_to_file(
             api_public_key,
-            reader,
+            _WatchedReader(reader, request),
             str(destination),
             chunk_size=settings.CRYPTO_CHUNK_SIZE,
         )
 
     try:
         await drive.download(connection, path, sink, settings.RECORDING_MAX_BYTES)
+    except ImportCancelled:
+        # Nobody is waiting for an answer; what matters is that the half
+        # of a file already on disk does not become a job.
+        await job_remove(job["uuid"])
+        log.info(f"User {user['user_id']} cancelled an import from Drive.")
+        return _error("The import was cancelled.", 499, "cancelled")
     except drive.DriveError as error:
         await job_remove(job["uuid"])
         if isinstance(error, drive.DriveUnauthorized):

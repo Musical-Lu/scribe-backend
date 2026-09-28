@@ -967,3 +967,24 @@ async def test_only_a_job_with_an_original_has_one_to_save(api, fake, original):
     )
 
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_import_leaves_no_job(api, fake, monkeypatch):
+    # The frontend's Cancel closes its connection mid-file; the import must
+    # stop there and take the half-made job with it.
+    from starlette.requests import Request
+
+    await connect(api, fake)
+
+    async def gone(self):
+        return True
+
+    monkeypatch.setattr(Request, "is_disconnected", gone)
+
+    response = await api.post(
+        "/api/v1/drive/import", json={"path": "Lectures/talk one.mp3"}
+    )
+
+    assert response.json()["reason"] == "cancelled"
+    assert "job" not in api.jobs
