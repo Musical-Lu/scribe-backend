@@ -31,7 +31,7 @@ Answers are shaped for the recorder's retry logic in the frontend:
 import asyncio
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
 from auth.oidc import get_current_user
@@ -45,6 +45,8 @@ from utils.crypto import (
 )
 from utils.log import get_logger
 from utils.recordings import (
+    DEFAULT_MIME,
+    RECOVERED_NAME,
     Busy,
     RecordingError,
     file_name,
@@ -80,6 +82,28 @@ async def _public_key(user_id: str):
     return deserialize_public_key_from_pem(await user_get_public_key(user_id))
 
 
+@router.get("/recordings")
+async def recordings_unfinished(user: dict = Depends(get_current_user)) -> JSONResponse:
+    """
+    The signed-in user's recordings that were never finished and have had
+    nothing sent to them for RECORDING_RECOVER_AFTER_MINUTES: for finishing
+    one whose own browser lost track of it (its storage wiped, its device
+    gone).  Only the parts before the first gap can be joined; `parts` says
+    how many that is, `held` how many are here at all.
+    """
+
+    try:
+        found = await asyncio.to_thread(
+            recordings.unfinished,
+            user["user_id"],
+            settings.RECORDING_RECOVER_AFTER_MINUTES * 60,
+        )
+    except RecordingError as error:
+        return _refused(error)
+
+    return JSONResponse({"recordings": found})
+
+
 @router.get("/recordings/{rid}")
 async def recording_status(
     rid: str, user: dict = Depends(get_current_user)
@@ -105,9 +129,12 @@ async def recording_part(
     seq: int,
     request: Request,
     user: dict = Depends(get_current_user),
+    mime: str | None = Query(default=None, alias="type", max_length=100),
 ) -> JSONResponse:
     """
-    One part of a recording, encrypted to disk as it arrives.
+    One part of a recording, encrypted to disk as it arrives.  `type` is the
+    audio type the browser records in, kept for finishing the recording
+    from elsewhere.
     """
 
     declared = request.headers.get("content-length")
@@ -118,7 +145,7 @@ async def recording_part(
     try:
         public_key = await _public_key((await _api_user())["user_id"])
         await recordings.write_part(
-            user["user_id"], rid, seq, request.stream(), public_key
+            user["user_id"], rid, seq, request.stream(), public_key, mime
         )
     except RecordingError as error:
         return _refused(error)
@@ -148,6 +175,23 @@ async def recording_discard(
     return JSONResponse({"ok": True})
 
 
+def _already(done: dict, count: int) -> JSONResponse:
+    """
+    The answer to finishing a recording that already is a job.  The same
+    job again for a repeated finish -- the answer was lost, a second tab
+    asked too -- but refused when this finish holds more than that job
+    does: it was finished from elsewhere while this browser went on
+    recording, and "done" would tell it to throw the rest away.
+    """
+
+    finished = done.get("parts")
+
+    if isinstance(finished, int) and count > finished:
+        return _refused(RecordingError("already finished"))
+
+    return JSONResponse({"done": done})
+
+
 @router.post("/recordings/{rid}/finish")
 async def recording_finish(
     rid: str,
@@ -166,13 +210,17 @@ async def recording_finish(
     count = item.parts
 
     try:
-        name = file_name(item.name, item.mime)
+        mime = item.mime or await asyncio.to_thread(recordings.mime, user_id, rid)
+        name = file_name(
+            item.name if item.mime else (item.name or RECOVERED_NAME),
+            mime or DEFAULT_MIME,
+        )
     except RecordingError as error:
         return _refused(error)
 
     try:
         if done := await asyncio.to_thread(recordings.done, user_id, rid):
-            return JSONResponse({"done": done})
+            return _already(done, count)
 
         missing = await asyncio.to_thread(recordings.missing, user_id, rid, count)
 
@@ -191,7 +239,7 @@ async def recording_finish(
         # Asked again under the claim: another request may have finished
         # it between the check above and taking the claim.
         if done := await asyncio.to_thread(recordings.done, user_id, rid):
-            return JSONResponse({"done": done})
+            return _already(done, count)
 
         api_user = await _api_user()
         api_private_key = await load_private_key(
@@ -220,7 +268,7 @@ async def recording_finish(
 
         await job_update(job["uuid"], status=JobStatusEnum.UPLOADED)
 
-        done = {"uuid": job["uuid"], "filename": name}
+        done = {"uuid": job["uuid"], "filename": name, "parts": count}
         await asyncio.to_thread(recordings.mark_done, user_id, rid, done)
     except RecordingError as error:
         if job:

@@ -104,7 +104,10 @@ class RecordingFinishRequest(BaseModel):
 
     parts: int = Field(ge=1, le=20000)
     name: str = Field(default="", max_length=500)
-    mime: str = Field(max_length=100)
+    # Absent when a recording is finished from a device other than the one
+    # that recorded it: the type its own browser sent with the parts is
+    # used then (utils/recordings.py).
+    mime: str | None = Field(default=None, max_length=100)
 
 
 class VideoStreamRequestBody(BaseModel):

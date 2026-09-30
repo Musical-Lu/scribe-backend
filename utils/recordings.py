@@ -37,7 +37,12 @@ Layout, one directory per recording::
 
     <API_FILE_STORAGE_DIR>/<user_id>/recordings/<rid>/part-000000.enc
                                                      /part-000001.enc
+                                                     /type
                                                      /done.json
+
+`type` is the audio type the browser said it records in, written with the
+first part that names one.  A recording finished from another device -- one
+whose own browser lost track of it -- has nothing else to say it.
 
 `user_id` comes from the signed-in user, never from the request; `rid` and
 `seq` are validated to a fixed shape before they reach a path.
@@ -73,6 +78,18 @@ MAX_PARTS = 20000
 PART_PREFIX = "part-"
 PART_SUFFIX = ".enc"
 DONE_FILE = "done.json"
+TYPE_FILE = "type"
+
+# What a recording is called when it is finished without its own browser:
+# the reader's name for it is encrypted in that browser and never sent here.
+RECOVERED_NAME = "Recovered recording"
+
+# A recovered recording's type when no part ever named one -- parts sent by
+# a recorder from before the type was sent.  Most browsers record WebM.
+DEFAULT_MIME = "audio/webm"
+
+# At most this many unfinished recordings are listed.
+MAX_LISTED = 50
 CLAIM_DIR = ".finishing"
 
 # A claim older than this is a finish that died half way (a restarted
@@ -127,6 +144,16 @@ def media_type(filename: str) -> str:
     return mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
 
+def base_type(mime: str | None) -> str | None:
+    """
+    `mime` without its parameters, if it is a type a recording may be.
+    """
+
+    base = (mime or "").split(";")[0].strip().lower()
+
+    return base if base in MIME_EXTENSIONS else None
+
+
 def file_name(name: str, mime: str) -> str:
     """
     The file name a finished recording is given: the reader's own name,
@@ -134,12 +161,12 @@ def file_name(name: str, mime: str) -> str:
     extension its type calls for.
     """
 
-    base_mime = (mime or "").split(";")[0].strip().lower()
-    extension = MIME_EXTENSIONS.get(base_mime)
+    base_mime = base_type(mime)
 
-    if not extension:
+    if not base_mime:
         raise RecordingError("unsupported audio type")
 
+    extension = MIME_EXTENSIONS[base_mime]
     stem = UNSAFE_NAME.sub("", str(name or "")).strip(" .")[:120] or "Recording"
 
     if stem.lower().endswith(extension):
@@ -237,9 +264,15 @@ class Recordings:
     def __init__(self, root: Path | str | None = None) -> None:
         self.root = Path(root if root is not None else settings.API_FILE_STORAGE_DIR)
 
-    def _dir(self, user_id: str, rid: str) -> Path:
+    @staticmethod
+    def _user(user_id: str) -> str:
         if not user_id or "/" in user_id or user_id.startswith("."):
             raise RecordingError("bad user")
+
+        return user_id
+
+    def _dir(self, user_id: str, rid: str) -> Path:
+        self._user(user_id)
 
         if not RID_PATTERN.match(rid or ""):
             raise RecordingError("bad recording id")
@@ -260,11 +293,15 @@ class Recordings:
         seq: int,
         stream: AsyncIterator[bytes],
         public_key: rsa.RSAPublicKey,
+        mime: str | None = None,
     ) -> int:
         """
         Encrypt one part to disk as it arrives.  Written to a temporary name
         and renamed into place, so a part is either whole or absent: a crash
         half way through must never leave a short part that looks complete.
+
+        `mime`, when it is a type a recording may be, is kept as the
+        recording's type unless one already is.
 
         Returns the number of plaintext bytes written.
         """
@@ -272,7 +309,15 @@ class Recordings:
         name = self._part_name(seq)
         directory = self._dir(user_id, rid)
 
-        if await asyncio.to_thread(self.done, user_id, rid):
+        if done := await asyncio.to_thread(self.done, user_id, rid):
+            finished = done.get("parts")
+
+            if isinstance(finished, int) and seq >= finished:
+                # Finished from another device while this one went on
+                # recording.  Said out loud: an "ok" here is what tells the
+                # browser it may throw the part away.
+                raise RecordingError("already finished")
+
             # Already a job; a late resend has nothing left to add to.
             return 0
 
@@ -299,6 +344,9 @@ class Recordings:
             except FileNotFoundError:
                 pass
             raise
+
+        if (known := base_type(mime)) and not (directory / TYPE_FILE).exists():
+            await asyncio.to_thread((directory / TYPE_FILE).write_text, known)
 
         # A recording still being added to is not stale, whatever its
         # creation time says -- the sweep goes by the directory's mtime.
@@ -350,6 +398,80 @@ class Recordings:
             return json.loads((self._dir(user_id, rid) / DONE_FILE).read_text())
         except (FileNotFoundError, ValueError):
             return None
+
+    def mime(self, user_id: str, rid: str) -> str | None:
+        """
+        The type the recording's own browser said it records in, if any
+        part named one.
+        """
+
+        try:
+            return base_type((self._dir(user_id, rid) / TYPE_FILE).read_text())
+        except (FileNotFoundError, OSError):
+            return None
+
+    def unfinished(
+        self, user_id: str, quiet_seconds: float, now: float | None = None
+    ) -> list[dict]:
+        """
+        This user's recordings that hold parts, are not a job and have had
+        nothing sent to them for `quiet_seconds` -- the ones a browser that
+        lost track of them (its storage wiped) can no longer finish.
+
+        One still being sent to is left out on purpose.  Its id is a
+        random 128-bit name nothing else knows, which is what keeps a
+        stolen or second session from finishing or deleting a recording
+        that is still going.  Newest first, at most MAX_LISTED.
+
+        Reading never touches a directory's mtime, so being listed does not
+        keep a recording from the sweep.
+        """
+
+        now = time.time() if now is None else now
+        recordings = self.root / self._user(user_id) / "recordings"
+
+        if not recordings.is_dir():
+            return []
+
+        found = []
+
+        for directory in recordings.iterdir():
+            rid = directory.name
+
+            if not RID_PATTERN.match(rid) or not directory.is_dir():
+                continue
+
+            try:
+                last = directory.stat().st_mtime
+            except FileNotFoundError:
+                continue
+
+            if now - last < quiet_seconds or self.done(user_id, rid):
+                continue
+
+            held = self.parts(user_id, rid)
+
+            if not held:
+                continue
+
+            # Only the parts before the first gap can be joined.
+            usable = next(
+                (index for index, seq in enumerate(held) if index != seq), len(held)
+            )
+
+            found.append(
+                {
+                    "id": rid,
+                    "parts": usable,
+                    "held": len(held),
+                    "last": last,
+                    "mime": self.mime(user_id, rid),
+                }
+            )
+
+        found.sort(key=lambda entry: entry["last"], reverse=True)
+
+        return found[:MAX_LISTED]
 
     def claim(self, user_id: str, rid: str) -> None:
         """

@@ -106,6 +106,11 @@ class Settings(BaseSettings):
     # The browser still holds anything not confirmed, so a recording taken
     # up again after this is sent again rather than lost.
     RECORDING_ABANDON_HOURS: int = 48
+    # A recording nothing has been sent to for this long is offered to be
+    # finished from anywhere (GET /recordings), for when the browser that
+    # made it lost track of it.  Until then it may well still be recording
+    # -- a phone that lost its connection mid-lecture -- and is not listed.
+    RECORDING_RECOVER_AFTER_MINUTES: int = 10
 
     # Sunet Drive (Nextcloud) integration (routers/drive.py, utils/drive.py).
     # Hosts Scribe will talk to on a user's behalf, as suffixes: an instance

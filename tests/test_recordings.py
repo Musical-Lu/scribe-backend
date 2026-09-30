@@ -196,6 +196,86 @@ async def test_done_drops_the_parts_and_ignores_late_ones(tmp_path, keys):
 
 
 @pytest.mark.asyncio
+async def test_a_part_past_what_was_finished_is_refused(tmp_path, keys):
+    """
+    Finished from another device while this one went on recording: a part
+    it never had must not be answered "ok", which lets the browser drop it.
+    """
+
+    store = Recordings(tmp_path)
+    _, public = keys["api"]
+
+    await store.write_part(USER, RID, 0, stream(b"a"), public)
+    store.mark_done(USER, RID, {"uuid": "job", "parts": 1})
+
+    assert await store.write_part(USER, RID, 0, stream(b"a"), public) == 0
+
+    with pytest.raises(RecordingError):
+        await store.write_part(USER, RID, 1, stream(b"b"), public)
+
+
+@pytest.mark.asyncio
+async def test_the_type_is_kept_from_the_first_part_that_names_one(tmp_path, keys):
+    store = Recordings(tmp_path)
+    _, public = keys["api"]
+
+    await store.write_part(USER, RID, 0, stream(b"a"), public, "text/html")
+    assert store.mime(USER, RID) is None
+
+    await store.write_part(USER, RID, 1, stream(b"b"), public, "audio/mp4;codecs=mp4a")
+    await store.write_part(USER, RID, 2, stream(b"c"), public, "audio/webm")
+
+    assert store.mime(USER, RID) == "audio/mp4"
+
+
+def age(root, rid, seconds):
+    old = time.time() - seconds
+    os.utime(root / USER / "recordings" / rid, (old, old))
+
+
+@pytest.mark.asyncio
+async def test_unfinished_lists_only_quiet_recordings_with_parts(tmp_path, keys):
+    store = Recordings(tmp_path)
+    _, public = keys["api"]
+    live, finished, gap = "a" * 32, "b" * 32, "c" * 32
+
+    await store.write_part(USER, RID, 0, stream(b"a"), public, "audio/ogg")
+    await store.write_part(USER, RID, 1, stream(b"b"), public)
+    await store.write_part(USER, live, 0, stream(b"a"), public)
+    await store.write_part(USER, finished, 0, stream(b"a"), public)
+    store.mark_done(USER, finished, {"uuid": "job", "parts": 1})
+    for seq in (0, 1, 3):
+        await store.write_part(USER, gap, seq, stream(b"x"), public)
+    (tmp_path / USER / "recordings" / "not-a-recording").mkdir()
+
+    age(tmp_path, RID, 700)
+    age(tmp_path, finished, 700)
+    age(tmp_path, gap, 900)
+
+    found = store.unfinished(USER, 600)
+
+    assert [entry["id"] for entry in found] == [RID, gap]
+    assert found[0] | {"last": 0} == {
+        "id": RID, "parts": 2, "held": 2, "last": 0, "mime": "audio/ogg"
+    }
+    assert (found[1]["parts"], found[1]["held"], found[1]["mime"]) == (2, 3, None)
+
+
+@pytest.mark.asyncio
+async def test_unfinished_is_per_user_and_leaves_the_sweep_alone(tmp_path, keys):
+    store = Recordings(tmp_path)
+    await store.write_part(USER, RID, 0, stream(b"a"), keys["api"][1])
+    age(tmp_path, RID, 3 * 3600)
+
+    assert store.unfinished("user-2", 0) == []
+    assert len(store.unfinished(USER, 0)) == 1
+    assert store.sweep(2 * 3600) == 1
+
+    with pytest.raises(RecordingError):
+        store.unfinished("../x", 0)
+
+
+@pytest.mark.asyncio
 async def test_only_one_finish_at_a_time(tmp_path, keys):
     store = Recordings(tmp_path)
     await store.write_part(USER, RID, 0, stream(b"a"), keys["api"][1])
@@ -330,7 +410,7 @@ async def test_a_recording_becomes_a_job_and_an_original(api, keys):
 
     assert response.status_code == 200
     done = response.json()["done"]
-    assert done == {"uuid": "job-1", "filename": "Lecture.webm"}
+    assert done == {"uuid": "job-1", "filename": "Lecture.webm", "parts": 2}
     assert api.jobs["job-1"]["status"] == "uploaded"
 
     user_dir = api.root / USER
@@ -427,6 +507,64 @@ async def test_a_discarded_recording_is_gone(api):
 
     assert (await api.delete(f"/recordings/{RID}")).status_code == 200
     assert (await api.get(f"/recordings/{RID}")).json() == {"parts": [], "done": None}
+
+
+@pytest.mark.asyncio
+async def test_a_recording_lost_by_its_browser_can_be_finished_from_the_list(api, keys):
+    await api.put(f"/recordings/{RID}/part/0", params={"type": "audio/mp4"}, content=b"one")
+    await api.put(f"/recordings/{RID}/part/1", content=b"two")
+    await api.put(f"/recordings/{RID}/part/3", content=b"four")
+
+    assert (await api.get("/recordings")).json() == {"recordings": []}
+
+    age(api.root, RID, 11 * 60)
+    listed = (await api.get("/recordings")).json()["recordings"]
+
+    assert [(e["id"], e["parts"], e["held"], e["mime"]) for e in listed] == [
+        (RID, 2, 3, "audio/mp4")
+    ]
+
+    response = await api.post(f"/recordings/{RID}/finish", json={"parts": 2})
+
+    assert response.json()["done"] == {
+        "uuid": "job-1", "filename": "Recovered recording.m4a", "parts": 2
+    }
+    assert read(keys["user"][0], api.root / USER / "job-1.orig.enc") == b"onetwo"
+    assert (await api.get("/recordings")).json() == {"recordings": []}
+
+
+@pytest.mark.asyncio
+async def test_a_recording_with_no_type_is_finished_as_webm(api):
+    await api.put(f"/recordings/{RID}/part/0", content=b"one")
+
+    response = await api.post(f"/recordings/{RID}/finish", json={"parts": 1, "name": "x"})
+
+    assert response.json()["done"]["filename"] == "x.webm"
+
+
+@pytest.mark.asyncio
+async def test_the_recording_browser_is_told_when_it_was_finished_elsewhere(api):
+    await api.put(f"/recordings/{RID}/part/0", content=b"one")
+    await api.post(f"/recordings/{RID}/finish", json={"parts": 1})
+
+    # The browser that recorded it comes back online with more.
+    assert (await api.put(f"/recordings/{RID}/part/1", content=b"two")).status_code == 422
+    # And asking first says how much of it the job holds.
+    assert (await api.get(f"/recordings/{RID}")).json()["done"]["parts"] == 1
+    assert (await api.post(f"/recordings/{RID}/finish", json=FINISH)).status_code == 422
+    assert (
+        await api.post(f"/recordings/{RID}/finish", json=FINISH | {"parts": 1})
+    ).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_a_bad_type_is_ignored_not_refused(api):
+    response = await api.put(
+        f"/recordings/{RID}/part/0", params={"type": "text/html"}, content=b"a"
+    )
+
+    assert response.status_code == 200
+    assert recording_router.recordings.mime(USER, RID) is None
 
 
 # --- The original's lifetime ---------------------------------------------------
