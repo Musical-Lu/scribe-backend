@@ -167,7 +167,7 @@ The frontend's recorder (`/record` in scribe-ui) sends a recording **in parts wh
 - `DELETE /recordings/{rid}` — an unfinished recording thrown away.
 - `rid` is `^[0-9a-f]{32}$`, chosen by the browser so a recording can start with no connection. The path is `<API_FILE_STORAGE_DIR>/<user_id>/recordings/<rid>/`, with `user_id` taken from the token and never from the request.
 - Answers follow the recorder's retry logic: 2xx move on, 409 send the listed parts, 422 never (stop retrying), 503 later.
-- `remove_abandoned_recordings` (hourly, scheduler worker only) sweeps recordings nobody has touched for `RECORDING_ABANDON_HOURS`. That includes the `done.json` of finished ones, which only needs to outlive a lost answer. The browser keeps what it has not had confirmed, so an unfinished recording swept by mistake is sent again, not lost.
+- `remove_abandoned_recordings` (hourly, scheduler worker only) sweeps recordings nobody has touched for `RECORDING_ABANDON_HOURS` (7 days). That includes the `done.json` of finished ones, which only needs to outlive a lost answer. The browser keeps what it has not had confirmed, so an unfinished recording swept by mistake is sent again, not lost.
 
 **The original** is served by `POST /transcriber/{job_id}/original` (the password goes in the body, hence POST), streamed with its decrypted file name. The job listing marks it with `has_original`. It lives exactly as long as the job: `job_files_remove()` in `db/job.py` is now the one list of a job's files, used by both `job_remove()` and the 7-day `job_cleanup()`. Add any new per-job file there.
 

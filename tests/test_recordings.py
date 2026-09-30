@@ -319,6 +319,24 @@ async def test_the_sweep_removes_only_what_nobody_touched(tmp_path, keys):
     assert store.parts(USER, other) == [0]
 
 
+def test_recordings_and_jobs_are_both_kept_7_days():
+    """
+    An unfinished recording is swept after the same 7 days a job (and so a
+    finished recording's original) keeps its files -- and the recorder in
+    scribe-ui drops what it still holds on the device after 7 days too.
+    """
+
+    from datetime import UTC, datetime, timedelta
+
+    from db.models import Job
+    from utils.settings import Settings
+
+    assert Settings.model_fields["RECORDING_ABANDON_HOURS"].default == 7 * 24
+
+    job = Job(user_id=USER)
+    assert abs(job.deletion_date - datetime.now(UTC).replace(tzinfo=None) - timedelta(days=7)) < timedelta(minutes=1)
+
+
 def test_file_names_are_cleaned_and_typed():
     assert file_name("Lecture 3", "audio/webm;codecs=opus") == "Lecture 3.webm"
     assert file_name("../../x/y", "audio/ogg") == "xy.ogg"

@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     # Parts of a recording nobody has sent to for this long are removed.
     # The browser still holds anything not confirmed, so a recording taken
     # up again after this is sent again rather than lost.
-    RECORDING_ABANDON_HOURS: int = 48
+    RECORDING_ABANDON_HOURS: int = 7 * 24
     # A recording nothing has been sent to for this long is offered to be
     # finished from anywhere (GET /recordings), for when the browser that
     # made it lost track of it.  Until then it may well still be recording
